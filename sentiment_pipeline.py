@@ -1,3 +1,6 @@
+import os
+import time
+
 import pandas as pd
 import numpy as np
 import json
@@ -13,58 +16,83 @@ import nltk
 from nltk.corpus import sentiwordnet as swn, wordnet as wn
 from nltk.tokenize import word_tokenize
 from groq import Groq
+from openai import OpenAI
 from main import clean_text, apply_lemmatization, remove_stopwords
+ 
+client = OpenAI(
+    base_url="https://router.huggingface.co/v1",
+    api_key=os.environ["HF_TOKEN"],  # set in terminal: $env:HF_TOKEN="hf_xxxx"
+)
 
-df = pd.read_csv('Movies.csv')
-df = df.head(50)    
+df = pd.read_csv('Movies.csv') 
+df = df.head(200)
 print(f"Loaded {len(df)} records\n")
 
-# ground truth labeling 
-
+# Prompts 
 PROMPTS = [
-    # Prompt A – direct polarity question
     lambda text: (
         f"Classify the sentiment of this movie review as exactly one word: "
         f"positive, negative, or neutral.\n\nReview: {text}\n\nSentiment:"
     ),
-    # Prompt B – audience emotion angle
     lambda text: (
         f"How would a typical viewer feel after reading this review? "
         f"Reply with exactly one word: positive, negative, or neutral.\n\n"
         f"Review: {text}\n\nFeeling:"
     ),
-    # Prompt C – critic perspective
     lambda text: (
         f"From a film-critic perspective, is the following review positive, "
         f"negative, or neutral? Reply with that single word only.\n\n"
         f"Review: {text}\n\nVerdict:"
     ),
 ]
-
-
-client = Groq(api_key="your_api_key_here")  # replace with your actual API key
-
-def groq_label(text: str, prompt_fn) -> str:
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt_fn(text)}],
-        max_tokens=10,
-    )
-    raw = response.choices[0].message.content.strip().lower()
-    for label in ("positive", "negative", "neutral"):
-        if label in raw:
-            return label
-    return "neutral"              
-
-
+ 
+def hf_label(text: str, prompt_fn) -> str:
+    for attempt in range(5):
+        try:
+            response = client.chat.completions.create(
+                model="Qwen/Qwen2.5-72B-Instruct:novita",
+                messages=[{"role": "user", "content": prompt_fn(text)}],
+                max_tokens=10,
+            )
+            raw = response.choices[0].message.content.strip().lower()
+            for label in ("positive", "negative", "neutral"):
+                if label in raw:
+                    return label
+            return "neutral"
+        except Exception as e:
+            print(f"  Error: {e} — retrying in 5s (attempt {attempt+1})")
+            time.sleep(5) 
+    return "neutral"
+ 
 def annotate_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Add annotator_1/2/3 columns via three Groq prompts."""
-    labels = {f"annotator_{i+1}": [] for i in range(3)}
-    for text in df["Review_Text"].fillna(""):
+    SAVE_PATH = "progress.csv"
+
+    if os.path.exists(SAVE_PATH):
+        saved = pd.read_csv(SAVE_PATH)
+        # Merge saved annotations back
+        for col in ["annotator_1", "annotator_2", "annotator_3"]:
+            if col in saved.columns:
+                df[col] = saved[col]
+        print(f"Resumed from saved progress ({saved['annotator_1'].notna().sum()} done)")
+    else:
+        df["annotator_1"] = None
+        df["annotator_2"] = None
+        df["annotator_3"] = None
+
+    for idx, row in df.iterrows():
+        # Skip already annotated rows
+        if pd.notna(row.get("annotator_1")):
+            continue
+
+        text = row["Review_Text"] if pd.notna(row["Review_Text"]) else ""
         for i, prompt_fn in enumerate(PROMPTS):
-            labels[f"annotator_{i+1}"].append(groq_label(text, prompt_fn))
-    for col, vals in labels.items():
-        df[col] = vals
+            label = hf_label(text, prompt_fn)
+            df.at[idx, f"annotator_{i+1}"] = label
+
+        df.to_csv(SAVE_PATH, index=False)
+        print(f"  Row {idx+1}/{len(df)} done — labels: "
+              f"{df.at[idx,'annotator_1']}, {df.at[idx,'annotator_2']}, {df.at[idx,'annotator_3']}")
+
     return df
 
 df = annotate_dataframe(df)
